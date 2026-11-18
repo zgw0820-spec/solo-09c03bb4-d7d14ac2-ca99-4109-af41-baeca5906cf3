@@ -11,7 +11,9 @@
 #   5. gateway outage -> command stays pending, never lost;
 #   6. restart of both services -> unfinished work resumes, nothing re-executed;
 #   7. gateway killed mid-execution -> id frozen as unknown, web keeps it
-#      unresolved and blocks that device; the id is never executed.
+#      unresolved and blocks that device; the id is never executed;
+#   8. one device with a deep backlog does not starve later devices, submits
+#      stay fast, and every backlog command runs exactly once.
 #
 # Expiry rules (unexecuted vs. still-verifying) are covered by pytest at
 # second granularity; the web form only accepts whole minutes.
@@ -122,6 +124,27 @@ echo "live-1: $(curl -sS "http://127.0.0.1:$WEB_PORT/api/commands/live-1")"
 wait_state ok-2 executed
 wait_state ok-3 executed
 
+echo "-- [8] one backlogged device does not starve later devices"
+for i in $(seq 1 12); do submit device-Z "bk-$i" 10 >/dev/null; done
+submit device-Y1 late-1 10 >/dev/null
+submit device-Y2 late-2 10 >/dev/null
+submit device-Y3 late-3 10 >/dev/null
+# the web must keep accepting commands quickly while the backlog is deep
+t=$(curl -sS -o /dev/null -w '%{time_total}' -X POST "http://127.0.0.1:$WEB_PORT/commands" \
+  --data-urlencode "device_id=device-Y4" --data-urlencode "command_id=late-4" \
+  --data-urlencode "deadline_minutes=10")
+echo "submit latency under backlog: ${t}s"
+wait_state late-1 executed 150
+wait_state late-2 executed 150
+wait_state late-3 executed 150
+wait_state late-4 executed 150
+z_pending=$(curl -sS "http://127.0.0.1:$WEB_PORT/api/commands?limit=500" | "$PY" -c \
+  "import json,sys; rows=json.load(sys.stdin); print(sum(1 for r in rows if r['device_id']=='device-Z' and r['state']=='pending'))")
+echo "device-Z still pending after later devices finished: $z_pending"
+[ "$z_pending" -gt 0 ]
+for i in $(seq 1 12); do wait_state "bk-$i" executed 400; done
+echo "backlog drained; late devices were not starved"
+
 echo "-- [7] gateway killed mid-execution"
 submit device-K kill-1 5 >/dev/null
 submit device-K kill-2 5 >/dev/null
@@ -161,7 +184,7 @@ echo "resume-1 after restart: $(curl -sS "http://127.0.0.1:$WEB_PORT/api/command
 
 sleep 0.5
 echo "-- final states"
-for c in ok-1 ok-2 ok-3 live-1 resume-1 kill-1 kill-2 kill-3; do
+for c in ok-1 ok-2 ok-3 live-1 resume-1 kill-1 kill-2 kill-3 bk-1 bk-12 late-1 late-4; do
   printf '%s=%s ' "$c" "$(web_state "$c")"
 done
 echo
@@ -174,7 +197,11 @@ port = sys.argv[1]
 rows = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/executions"))
 by_id = {r["command_id"]: r for r in rows}
 
-must_execute_once = ["ok-1", "ok-2", "ok-3", "live-1", "resume-1", "kill-3"]
+must_execute_once = (
+    ["ok-1", "ok-2", "ok-3", "live-1", "resume-1", "kill-3"]
+    + [f"bk-{i}" for i in range(1, 13)]
+    + [f"late-{i}" for i in range(1, 5)]
+)
 for cid in must_execute_once:
     assert cid in by_id, f"{cid} missing at gateway"
     assert by_id[cid]["state"] == "executed", by_id[cid]

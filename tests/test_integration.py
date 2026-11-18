@@ -166,28 +166,36 @@ def test_lost_receipt_blocks_same_device_but_not_other(services, monkeypatch):
 
     d = make_dispatcher(monkeypatch, web_main, transport)
 
-    def c1_unresolved_but_c3_done():
-        return (
-            web_main.store.get("c1")["state"] == "inflight"
-            and web_main.store.get("c3")["state"] == "executed"
+    async def body(_d):
+        def c1_unresolved_but_c3_done():
+            return (
+                web_main.store.get("c1")["state"] == "inflight"
+                and web_main.store.get("c3")["state"] == "executed"
+            )
+
+        assert await wait_until(c1_unresolved_but_c3_done)
+        # Other device finished independently; the blocked device's queue did
+        # not move, and c2 was never even delivered to the gateway.
+        assert web_main.store.get("c2")["state"] == "pending"
+        assert gw_main.store.get("c2") is None
+
+        assert await wait_until(
+            lambda: web_main.store.get("c1")["state"] == "executed"
+        )
+        assert gw_main.store.get("c1")["executions"] == 1
+        # Once c1 is verified, the queue drains in order.
+        assert await wait_until(
+            lambda: web_main.store.get("c2")["state"] == "executed"
+        )
+        assert gw_main.store.get("c1")["executions"] == 1
+        assert gw_main.store.get("c2")["executions"] == 1
+        # FIFO: c2's execution is not earlier than c1's.
+        assert (
+            gw_main.store.get("c2")["received_at"]
+            >= gw_main.store.get("c1")["executed_at"]
         )
 
-    assert drive(d, c1_unresolved_but_c3_done)
-    # Other device finished independently; the blocked device's queue did not
-    # move, and c2 was never even delivered to the gateway.
-    assert web_main.store.get("c2")["state"] == "pending"
-    assert gw_main.store.get("c2") is None
-
-    assert drive(d, lambda: web_main.store.get("c1")["state"] == "executed")
-    assert gw_main.store.get("c1")["executions"] == 1
-    assert drive(d, lambda: web_main.store.get("c2")["state"] == "executed")
-    assert gw_main.store.get("c2")["executions"] == 1
-    # FIFO: c2's execution is not earlier than c1's.
-    assert gw_main.store.get("c2")["received_at"] >= gw_main.store.get("c1")["executed_at"]
-    # Once c1 is verified, the queue drains in order.
-    assert drive(d, lambda: web_main.store.get("c2")["state"] == "executed")
-    assert gw_main.store.get("c1")["executions"] == 1
-    assert gw_main.store.get("c2")["executions"] == 1
+    scenario(d, body)
 
 
 def test_duplicate_submission_never_executes_twice(services, monkeypatch):
@@ -349,3 +357,185 @@ def test_gateway_restart_mid_flight_freezes_id(services, monkeypatch):
         assert gw_main.store.get("c1")["executions"] == 0  # never re-executed
 
     scenario(d, body)
+
+
+# ----------------------------------------------------- scheduling under load
+
+
+def pending_count(web_main, device):
+    with web_main.store.connect() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM commands WHERE device_id=? AND state='pending'",
+            (device,),
+        ).fetchone()["n"]
+
+
+def gateway_running(gw_main) -> int:
+    with gw_main.store.connect() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) AS n FROM executions WHERE state='running'"
+        ).fetchone()["n"]
+
+
+def test_slot_cap_and_fairness_with_one_backlogged_device(services, monkeypatch):
+    """One device with a deep backlog must not starve later devices, and the
+    number of concurrent gateway deliveries never exceeds the slot cap."""
+    gw_main, web_main = services
+    gw_main.EXECUTION_DELAY = 0.15
+    transport = httpx.ASGITransport(app=gw_main.app)
+
+    for i in range(12):  # the backlogged device, submitted first
+        web_main.store.submit(
+            device_id="d-backlog", command_id=f"b-{i}", deadline=deadline_in(5)
+        )
+    for d in range(5):  # later devices, one command each
+        web_main.store.submit(
+            device_id=f"d-{d}", command_id=f"s-{d}", deadline=deadline_in(5)
+        )
+
+    d = make_dispatcher(monkeypatch, web_main, transport)
+    peak = {"running": 0}
+
+    async def body(_d):
+        # Later devices all finish while the backlog device is still queued.
+        assert await wait_until(
+            lambda: all(
+                web_main.store.get(f"s-{i}")["state"] == "executed" for i in range(5)
+            ),
+            timeout=10,
+        )
+        assert pending_count(web_main, "d-backlog") > 0
+        # Same-device FIFO held and nothing was executed twice.
+        assert await wait_until(
+            lambda: all(
+                web_main.store.get(f"b-{i}")["state"] == "executed" for i in range(12)
+            ),
+            timeout=15,
+        )
+
+    async def runner():
+        _d = d
+
+        async def watch():
+            while True:
+                peak["running"] = max(peak["running"], gateway_running(gw_main))
+                await asyncio.sleep(0.01)
+
+        d.start()
+        watcher = asyncio.create_task(watch())
+        try:
+            await body(d)
+        finally:
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+            await d.stop()
+
+    asyncio.run(runner())
+    assert peak["running"] <= 4  # the slot cap was never exceeded
+    assert peak["running"] >= 2  # slots were actually shared in parallel
+    for i in range(12):
+        assert gw_main.store.get(f"b-{i}")["executions"] == 1
+    for i in range(5):
+        assert gw_main.store.get(f"s-{i}")["executions"] == 1
+
+
+def test_verification_not_starved_by_delivery_load(services, monkeypatch):
+    """While every slot is contested by queued deliveries, a lost receipt is
+    still verified promptly (probes get a guaranteed share of the slots)."""
+    gw_main, web_main = services
+    gw_main.EXECUTION_DELAY = 0.15
+    transport = httpx.ASGITransport(app=gw_main.app)
+
+    web_main.store.submit(
+        device_id="d0", command_id="lost-0", deadline=deadline_in(5), drop_receipt=True
+    )
+    for d in range(4):  # enough queued work to keep all 4 slots busy
+        for i in range(6):
+            web_main.store.submit(
+                device_id=f"q-{d}", command_id=f"q-{d}-{i}", deadline=deadline_in(5)
+            )
+
+    d = make_dispatcher(monkeypatch, web_main, transport)
+
+    async def body(_d):
+        assert await wait_until(
+            lambda: web_main.store.get("lost-0")["state"] == "executed",
+            timeout=10,
+        )
+        row = web_main.store.get("lost-0")
+        assert row["receipt_lost"] == 1 and "核实" in row["detail"]
+        # The verification finished while other devices were still queued,
+        # i.e. probes were not starved by the delivery load.
+        assert any(
+            web_main.store.get(f"q-{d}-{i}")["state"] == "pending"
+            for d in range(4)
+            for i in range(6)
+        )
+
+    scenario(d, body)
+    assert gw_main.store.get("lost-0")["executions"] == 1
+
+
+def test_stranded_claim_is_recovered_via_lease(services, monkeypatch):
+    """A command claimed by a dispatcher task that vanished (never sent, lease
+    expired) is probed, found unknown at the gateway, re-queued and delivered
+    -- exactly once."""
+    gw_main, web_main = services
+    transport = httpx.ASGITransport(app=gw_main.app)
+    web_main.store.submit(device_id="d1", command_id="c1", deadline=deadline_in(5))
+    web_main.store.submit(device_id="d1", command_id="c2", deadline=deadline_in(5))
+
+    d = make_dispatcher(monkeypatch, web_main, transport)
+
+    async def body(_d):
+        # Simulate a claim whose task died before touching the network:
+        # inflight, wire_state=claimed, lease already lapsed.
+        past = (
+            datetime.now(timezone.utc) - timedelta(seconds=5)
+        ).isoformat(timespec="microseconds")
+        with web_main.store.connect() as conn:
+            conn.execute(
+                "UPDATE commands SET state='inflight', wire_state='claimed', "
+                "attempts=1, last_attempt_at=?, next_check_at=? "
+                "WHERE command_id='c1'",
+                (past, past),
+            )
+        assert await wait_until(
+            lambda: web_main.store.get("c1")["state"] == "executed"
+        )
+        assert await wait_until(
+            lambda: web_main.store.get("c2")["state"] == "executed"
+        )
+
+    scenario(d, body)
+    assert gw_main.store.get("c1")["executions"] == 1
+    assert gw_main.store.get("c2")["executions"] == 1
+
+
+def test_submit_stays_fast_with_large_backlog(services, monkeypatch):
+    """Accepting a new command must not scan the backlog: submit stays fast
+    while thousands of commands are queued and the dispatcher is busy."""
+    gw_main, web_main = services
+    gw_main.EXECUTION_DELAY = 0.3  # keep all slots busy during the measurement
+    transport = httpx.ASGITransport(app=gw_main.app)
+    for i in range(1000):
+        web_main.store.submit(
+            device_id="bulk", command_id=f"bulk-{i}", deadline=deadline_in(30)
+        )
+
+    d = make_dispatcher(monkeypatch, web_main, transport)
+
+    async def body(_d):
+        await pause(0.3)  # let the dispatcher start churning the backlog
+        start = time.monotonic()
+        web_main.store.submit(
+            device_id="hot", command_id="hot-1", deadline=deadline_in(5)
+        )
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.5, f"submit took {elapsed:.3f}s under backlog"
+        assert await wait_until(
+            lambda: web_main.store.get("hot-1")["state"] == "executed", timeout=10
+        )
+
+    scenario(d, body)
+    assert gw_main.store.get("hot-1")["executions"] == 1

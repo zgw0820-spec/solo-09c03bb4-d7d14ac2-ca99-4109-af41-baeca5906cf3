@@ -26,6 +26,13 @@ answers the verification query; it is never assumed to have failed.
 Only `claimed` commands may be returned to the queue when the gateway says it
 has no record.  A `sent` command with no gateway record stays inflight: bytes
 may still be in transit, so "not received yet" is not "not executed".
+
+Gateway concurrency is capped by *slots* (deliveries + verification probes
+together).  `claim_batch` hands out slots inside one short transaction and
+stamps each claimed row with `next_check_at`: for a delivery it is the slot
+lease (a crashed dispatcher cannot wedge the device queue -- the row becomes
+probe-able when the lease lapses), for a verification reservation it is the
+earliest time the next probe may run.
 """
 from __future__ import annotations
 
@@ -53,12 +60,14 @@ CREATE TABLE IF NOT EXISTS commands (
     receipt_lost    INTEGER NOT NULL DEFAULT 0,
     wire_state      TEXT,
     last_attempt_at TEXT,
+    next_check_at   TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS by_device_state ON commands(device_id, state, id);
 CREATE INDEX IF NOT EXISTS by_state ON commands(state);
+CREATE INDEX IF NOT EXISTS by_state_check ON commands(state, next_check_at, id);
 """
 
 TERMINAL_STATES = ("executed", "failed", "unexecuted", "rejected")
@@ -86,6 +95,14 @@ def normalize_deadline(value: datetime) -> str:
 
 def is_overdue(deadline: str, now: Optional[str] = None) -> bool:
     return (now or utcnow()) >= deadline
+
+
+def lease_expiry(lease_seconds: float) -> str:
+    """ISO timestamp ``lease_seconds`` in the future (delivery-slot deadline)."""
+    return datetime.fromtimestamp(
+        datetime.now(timezone.utc).timestamp() + max(0.0, lease_seconds),
+        tz=timezone.utc,
+    ).isoformat(timespec="microseconds")
 
 
 class CommandIdConflict(Exception):
@@ -122,6 +139,12 @@ class Store:
     def init(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            cols = {
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(commands)").fetchall()
+            }
+            if "next_check_at" not in cols:  # upgrade databases from before slots
+                conn.execute("ALTER TABLE commands ADD COLUMN next_check_at TEXT")
 
     # ------------------------------------------------------------------ reads
     def get(self, command_id: str) -> Optional[sqlite3.Row]:
@@ -136,10 +159,20 @@ class Store:
                 "SELECT * FROM commands ORDER BY id DESC LIMIT ?", (limit,)
             ).fetchall()
 
-    def inflight(self) -> list[sqlite3.Row]:
+    def inflight_due(self, *, now: str, limit: int) -> list[sqlite3.Row]:
+        """Oldest inflight commands due for a verification probe.
+
+        Bounded by ``limit``: with thousands of inflight rows the dispatcher
+        never reads the whole backlog just to pick a few probes.  A row whose
+        ``next_check_at`` lies in the future is skipped, so per-command probe
+        pacing survives restarts and does not depend on in-memory state.
+        """
         with self.connect() as conn:
             return conn.execute(
-                "SELECT * FROM commands WHERE state='inflight' ORDER BY id"
+                "SELECT * FROM commands WHERE state='inflight' "
+                "AND (next_check_at IS NULL OR next_check_at <= ?) "
+                "ORDER BY id LIMIT ?",
+                (now, limit),
             ).fetchall()
 
     def counts(self) -> dict[str, int]:
@@ -208,9 +241,20 @@ class Store:
         """Retire never-sent commands whose deadline has passed.
 
         Inflight rows are intentionally untouched: an unknown outcome must be
-        verified with the gateway, not guessed.
+        verified with the gateway, not guessed.  A cheap read gates the write
+        transaction so an idle tick does not take the write lock at all.
         """
         now = utcnow()
+        with self.connect() as conn:
+            if (
+                conn.execute(
+                    "SELECT 1 FROM commands WHERE state='pending' AND deadline <= ? "
+                    "LIMIT 1",
+                    (now,),
+                ).fetchone()
+                is None
+            ):
+                return 0
         with self._tx() as conn:
             cur = conn.execute(
                 "UPDATE commands SET state='unexecuted', detail=?, updated_at=? "
@@ -219,21 +263,52 @@ class Store:
             )
             return cur.rowcount
 
-    def claim_batch(self, *, retry_seconds: float = 1.0) -> list[sqlite3.Row]:
-        """Atomically claim the head of each device queue.
+    def claim_batch(
+        self,
+        *,
+        retry_seconds: float = 1.0,
+        max_slots: int = 4,
+        in_flight: int = 0,
+        scan_limit: int = 200,
+        verify_limit: int = 2,
+        verify_interval: float = 1.0,
+        lease_seconds: float = 30.0,
+    ) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+        """Atomically hand out at most ``max_slots - in_flight`` gateway slots.
+
+        A slot is either a delivery (pending -> inflight) or a verification
+        probe reservation (inflight row stamped with a fresh ``next_check_at``
+        lease).  Returns ``(deliveries, verifications)``.
 
         * Expired pending commands become unexecuted (never sent).
         * A device with an inflight command is blocked regardless of that
           command's deadline (outcome unknown => cannot pass it).
         * Only the oldest eligible pending command per device is claimed, so
           same-device commands run strictly in submission(order) = id order.
-        * Different devices are all claimed in the same pass.
+        * Device heads are visited in round-robin order keyed by the head's
+          row id, so a device with a huge backlog cannot starve devices whose
+          commands were submitted later.
+        * Verification probes are interleaved with deliveries (one verify,
+          one deliver, ...) so receipt verification is never starved either.
+        * Both candidate pools are read with small LIMITs inside one short
+          ``BEGIN IMMEDIATE`` transaction: the whole backlog is never scanned
+          and the SQLite write lock is held only for a few index lookups.
+        * A claimed delivery carries a lease (``next_check_at``); if the
+          dispatcher dies before writing to the network, the row becomes
+          probe-able once the lease lapses instead of blocking its device
+          queue forever.
         """
+        budget = max(0, max_slots - max(0, in_flight))
+        if budget == 0:
+            return [], []
+
         now = utcnow()
         cutoff = datetime.fromtimestamp(
             datetime.now(timezone.utc).timestamp() - max(0.0, retry_seconds),
             tz=timezone.utc,
         ).isoformat(timespec="microseconds")
+        lease_to = lease_expiry(lease_seconds)
+        verify_to = lease_expiry(verify_interval)
 
         with self._tx() as conn:
             conn.execute(
@@ -241,40 +316,92 @@ class Store:
                 "WHERE state='pending' AND deadline <= ?",
                 ("截止时间已过，指令未下发", now, now),
             )
-            rows = conn.execute(
-                "SELECT * FROM commands WHERE state IN ('pending','inflight') "
-                "ORDER BY id"
+            # Bounded candidate pools only -- never the whole backlog.
+            heads = conn.execute(
+                "SELECT * FROM ("
+                "   SELECT *, MIN(id) OVER (PARTITION BY device_id) AS head_id"
+                "   FROM commands WHERE state='pending'"
+                ") WHERE id = head_id ORDER BY id LIMIT ?",
+                (scan_limit,),
             ).fetchall()
-            # Every device with an inflight command is blocked up front, so an
-            # older pending row can never jump ahead of an unknown outcome.
-            blocked = {
-                row["device_id"] for row in rows if row["state"] == "inflight"
-            }
-            claimed: list[sqlite3.Row] = []
-            for row in rows:
-                if row["state"] != "pending":
-                    continue
-                device = row["device_id"]
-                if device in blocked:
-                    continue
-                if row["last_attempt_at"] and row["last_attempt_at"] > cutoff:
-                    # Still in backoff (e.g. gateway unreachable); don't spin.
-                    blocked.add(device)
-                    continue
-                cur = conn.execute(
-                    "UPDATE commands SET state='inflight', wire_state='claimed', "
-                    "attempts=attempts+1, last_attempt_at=?, detail=?, updated_at=? "
-                    "WHERE id=? AND state='pending'",
-                    (now, "正在下发，等待网关回执", now, row["id"]),
-                )
-                if cur.rowcount == 1:
-                    blocked.add(device)
-                    claimed.append(
+            due = conn.execute(
+                "SELECT * FROM commands WHERE state='inflight' "
+                "AND (next_check_at IS NULL OR next_check_at <= ?) "
+                "ORDER BY id LIMIT ?",
+                (now, max(verify_limit, budget)),
+            ).fetchall()
+
+            deliveries: list[sqlite3.Row] = []
+            verifications: list[sqlite3.Row] = []
+            blocked: set[str] = set()  # devices claimed or backed off this pass
+            inflight_devices: dict[str, bool] = {}  # exact per-device cache
+
+            def device_blocked(device: str) -> bool:
+                # Exact per-device check (indexed point query): a device with
+                # an inflight command is blocked no matter how large the
+                # global inflight backlog grows.
+                if device not in inflight_devices:
+                    inflight_devices[device] = (
                         conn.execute(
-                            "SELECT * FROM commands WHERE id=?", (row["id"],)
+                            "SELECT 1 FROM commands WHERE device_id=? "
+                            "AND state='inflight' LIMIT 1",
+                            (device,),
                         ).fetchone()
+                        is not None
                     )
-            return claimed
+                return inflight_devices[device]
+
+            hi = 0  # round-robin cursor into device heads
+            vi = 0  # cursor into due verifications
+            # Alternate: one verification, then one device head, repeat.
+            # This keeps receipt verification moving even when many devices
+            # are queued, and lets many devices share the slots even when one
+            # device has thousands of queued commands.
+            while len(deliveries) + len(verifications) < budget:
+                progressed = False
+                if vi < len(due) and len(verifications) < verify_limit:
+                    row = due[vi]
+                    vi += 1
+                    cur = conn.execute(
+                        "UPDATE commands SET next_check_at=?, updated_at=? "
+                        "WHERE id=? AND state='inflight'",
+                        (verify_to, now, row["id"]),
+                    )
+                    if cur.rowcount == 1:
+                        verifications.append(
+                            conn.execute(
+                                "SELECT * FROM commands WHERE id=?", (row["id"],)
+                            ).fetchone()
+                        )
+                        progressed = True
+                while hi < len(heads) and len(deliveries) + len(verifications) < budget:
+                    row = heads[hi]
+                    hi += 1
+                    device = row["device_id"]
+                    if device in blocked or device_blocked(device):
+                        continue
+                    if row["last_attempt_at"] and row["last_attempt_at"] > cutoff:
+                        # Still in backoff (e.g. gateway unreachable).
+                        blocked.add(device)
+                        continue
+                    cur = conn.execute(
+                        "UPDATE commands SET state='inflight', wire_state='claimed', "
+                        "attempts=attempts+1, last_attempt_at=?, next_check_at=?, "
+                        "detail=?, updated_at=? WHERE id=? AND state='pending'",
+                        (now, lease_to, "正在下发，等待网关回执", now, row["id"]),
+                    )
+                    if cur.rowcount == 1:
+                        blocked.add(device)
+                        deliveries.append(
+                            conn.execute(
+                                "SELECT * FROM commands WHERE id=?", (row["id"],)
+                            ).fetchone()
+                        )
+                        progressed = True
+                        break  # next slot goes to a verification / other device
+                if not progressed:
+                    break
+            return deliveries, verifications
 
     def mark_sent(self, command_id: str) -> bool:
         """Write-ahead marker set immediately before the HTTP request.
@@ -315,6 +442,35 @@ class Store:
                 ("重启前未写出网络，重新排队", utcnow()),
             )
             return cur.rowcount
+
+    def make_inflight_due(self) -> int:
+        """On startup, make every inflight command immediately probe-able.
+
+        Probing by command id is always safe, and after a restart nothing
+        is known about outstanding leases, so the first verification pass
+        should not wait for stale leases to lapse.  Pacing resumes with the
+        lease each probe stamps on the row.
+        """
+        with self._tx() as conn:
+            cur = conn.execute(
+                "UPDATE commands SET next_check_at=NULL, updated_at=? "
+                "WHERE state='inflight'",
+                (utcnow(),),
+            )
+            return cur.rowcount
+
+    def defer_check(self, command_id: str, delay_seconds: float) -> None:
+        """Push this command's next verification probe into the future.
+
+        Used to pace probes (after a lost receipt) and to re-arm the slot
+        lease of a delivery whose outcome is still ambiguous.
+        """
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE commands SET next_check_at=?, updated_at=? "
+                "WHERE command_id=? AND state='inflight'",
+                (lease_expiry(delay_seconds), utcnow(), command_id),
+            )
 
     def mark_unverified(self, command_id: str, detail: str) -> None:
         with self._tx() as conn:

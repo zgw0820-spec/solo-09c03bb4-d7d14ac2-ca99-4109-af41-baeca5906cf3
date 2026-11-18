@@ -16,6 +16,9 @@ from .store import DISPLAY, CommandIdConflict, Store
 
 DB_PATH = os.environ.get("OPS_DB", "/data/ops.db")
 GATEWAY_URL = os.environ.get("GATEWAY_URL", "http://gateway:8001")
+# Total gateway interactions (deliveries + verification probes) that may run
+# concurrently; everything else waits in SQLite.
+MAX_SLOTS = int(os.environ.get("OPS_MAX_SLOTS", "4"))
 
 store = Store(DB_PATH)
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -26,7 +29,7 @@ dispatcher: Dispatcher | None = None
 async def lifespan(_app: FastAPI):
     global dispatcher
     store.init()
-    dispatcher = Dispatcher(store, GATEWAY_URL)
+    dispatcher = Dispatcher(store, GATEWAY_URL, max_slots=MAX_SLOTS)
     dispatcher.start()
     try:
         yield
@@ -118,8 +121,8 @@ def api_detail(command_id: str):
 
 
 @app.get("/api/commands")
-def api_list():
-    return [row_to_dict(r) for r in store.list()]
+def api_list(limit: int = 300):
+    return [row_to_dict(r) for r in store.list(limit)]
 
 
 @app.post("/commands/{command_id}/drop-receipt")
